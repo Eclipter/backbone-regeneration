@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import shlex
@@ -15,7 +16,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
-from base2backbone.runtime import PROGRESS_BAR_COLOR
+from ..runtime import PROGRESS_BAR_COLOR
 
 DEFAULT_PHENIX_MODULE = 'phenix/2.0'
 DEFAULT_MOLPROBITY_BIN_DIR = Path('/opt/shared_soft/phenix2.0/bin')
@@ -340,9 +341,11 @@ def annotate_benchmark_rows_with_molprobity(
         return rows
 
     tasks = [(row, *task_kwargs) for row in rows]
+    # Fresh module lookup: survives notebook hot-reload (stale __globals__ / missing sys.modules key).
+    row_task = importlib.import_module(__name__)._molprobity_row_task
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         results = list(tqdm(
-            ex.map(_molprobity_row_task, tasks),
+            ex.map(row_task, tasks),
             total=len(tasks),
             desc='MolProbity',
             leave=False,

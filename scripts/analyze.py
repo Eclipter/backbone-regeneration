@@ -1,10 +1,12 @@
 # %% Imports
 import hashlib
+import importlib.util
 import os.path as osp
 import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import warnings
@@ -12,7 +14,26 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache, partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Hashable, cast
+
+_scripts_dir = Path(__file__).resolve().parent
+_repo_root = _scripts_dir.parent
+if str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+
+# Bootstrap PyNAMod without loading base2backbone.__init__ (it imports pynamod-heavy modules).
+_bootstrap_py = _repo_root / 'src' / 'base2backbone' / '_pynamod_bootstrap.py'
+_bootstrap_spec = importlib.util.spec_from_file_location(
+    'base2backbone._pynamod_bootstrap', _bootstrap_py)
+assert _bootstrap_spec is not None and _bootstrap_spec.loader is not None
+_bootstrap_mod = importlib.util.module_from_spec(_bootstrap_spec)
+_bootstrap_spec.loader.exec_module(_bootstrap_mod)
+_bootstrap_mod.ensure_pynamod_importable()
+for _mod_name in list(sys.modules):
+    if _mod_name == 'base2backbone' or _mod_name.startswith('base2backbone.'):
+        del sys.modules[_mod_name]
+
+from config import BASE
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,20 +43,18 @@ import seaborn as sns
 import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
-from config import BASE
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
 from base2backbone.dataset import DNADataModule
-from base2backbone.eval.knn_baseline import (KnnBaselineState,
-                                             build_knn_baseline_state,
-                                             dataset_samples_cached,
-                                             init_knn_baseline_worker,
-                                             run_knn_baseline_structure_batch_pooled,
-                                             run_knn_protocol,
-                                             select_feature_columns)
+from base2backbone.eval.best_of_k_benchmark import \
+    run_base2backbone_best_of_k_benchmark
+from base2backbone.eval.knn_baseline import (
+    KnnBaselineState, build_knn_baseline_state, dataset_samples_cached,
+    init_knn_baseline_worker, run_knn_baseline_structure_batch_pooled,
+    run_knn_protocol, select_feature_columns)
 from base2backbone.eval.local_geometry import (
     backbone_local_in_target_frame, backbone_segments_from_local_coords,
     bond_segments_from_nt_graph, coords_local_per_nt,
@@ -46,23 +65,31 @@ from base2backbone.eval.molprobity import (
     annotate_benchmark_rows_with_molprobity, print_molprobity_method_summaries,
     print_molprobity_summary, summarize_molprobity_rows)
 from base2backbone.eval.structure_runners import (
-    CheckpointSamplerAdapter,
-    init_base2backbone_inference_worker,
-    run_base2backbone_best_of_k_benchmark,
-    run_base2backbone_inference_batch_pooled,
-    run_mean_baseline_structure,
-)
+    CheckpointSamplerAdapter, init_base2backbone_inference_worker,
+    predict_backbone_from_chain_records,
+    run_base2backbone_inference_batch_pooled, run_mean_baseline_structure)
 from base2backbone.geometry.backbone import build_backbone_local
-from base2backbone.inference import \
-    _build_output_universe as build_output_universe
-from base2backbone.inference import \
-    _predict_backbone_from_chain_records as predict_backbone_from_chain_records
 from base2backbone.inference import (write_phenix_hybrid_structure,
                                      write_structure)
+from base2backbone.inference import \
+    _build_output_universe as build_output_universe
 from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
                                    load_analysis_run_artifacts)
 from base2backbone.torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN
+
+# Hot-reload eval stack on every imports-cell run (no kernel restart needed).
+for _eval_mod in (
+    'base2backbone.eval.best_of_k_benchmark',
+    'base2backbone.eval.structure_runners',
+    'base2backbone.eval.structure_rmsd',
+    'base2backbone.eval.molprobity',
+    'base2backbone.eval.knn_baseline',
+    'base2backbone.eval.local_geometry',
+    'base2backbone.eval',
+):
+    sys.modules.pop(_eval_mod, None)
+
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 ANALYSIS_TMP_ROOT = Path(__file__).resolve().parents[1] / 'data'
@@ -74,6 +101,12 @@ BEST_OF_K_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'best_of_k_molprobity'
 MOLPROBITY_TIMEOUT_S = 600
 MOLPROBITY_MAX_WORKERS = 32
 RMSD_EVAL_BATCH_SIZE = 20000
+BASE2BACKBONE_WINDOW_BATCH_SIZE = 20000
+BASE2BACKBONE_STRUCTURE_BATCH_SIZE = 4
+BASE2BACKBONE_BENCHMARK_TIMESTEPS = 15
+BEST_OF_K_LIST = [1, 2, 4, 7, 10, 15]
+BEST_OF_K_BENCHMARK_TIMESTEPS = 15
+
 
 # %% Load prerequisites
 run_id = 'torsions/11/baseline'
@@ -250,11 +283,12 @@ def run_structure_benchmark(
                 leave=False,
                 colour=PROGRESS_BAR_COLOR,
             ):
-                batch = futures[fut]
+                batch_item = futures[fut]
                 try:
                     result = fut.result()
                 except Exception as e:
                     if submit_batch_size is not None and submit_batch_size > 1:
+                        path_batch = cast(list[Path], batch_item)
                         result = {
                             _batch_result_key(path): {
                                 'success': False,
@@ -263,7 +297,7 @@ def run_structure_benchmark(
                                 'output_pdb': None,
                                 'stderr': repr(e),
                             }
-                            for path in batch
+                            for path in path_batch
                         }
                     else:
                         result = {
@@ -275,7 +309,8 @@ def run_structure_benchmark(
                         }
 
                 if submit_batch_size is not None and submit_batch_size > 1:
-                    for input_path in batch:
+                    path_batch = cast(list[Path], batch_item)
+                    for input_path in path_batch:
                         res = result.get(
                             _batch_result_key(input_path),
                             {
@@ -289,7 +324,7 @@ def run_structure_benchmark(
                         append_result(input_path, res)
                     continue
 
-                append_result(batch, result)
+                append_result(cast(Path, batch_item), result)
 
     print(
         f'{label}: processed {len(rows)} structures '
@@ -824,7 +859,7 @@ for mode in target_modes:
             mode_linestyles[mode],
         )
 ax.set_xlabel('Эпоха', fontsize=18)
-ax.set_ylabel('RMSD остова (Å)', fontsize=18)
+ax.set_ylabel('СКО остова (Å)', fontsize=18)
 ax.legend(fontsize=14)
 sns.despine(ax=ax, top=True, right=True)
 fig.tight_layout()
@@ -844,7 +879,7 @@ bars = ax.barh(
     color=[mode_colors[mode] for mode in target_modes],
 )
 ax.bar_label(bars, labels=[f'{value:.2f}' for value in test_values], fontsize=14, padding=4)
-ax.set_xlabel('RMSD остова (Å)', fontsize=18)
+ax.set_xlabel('СКО остова (Å)', fontsize=18)
 sns.despine(ax=ax, top=True, right=True)
 fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'test.png'), bbox_inches='tight', dpi=300)
@@ -1208,11 +1243,6 @@ view.show()
 
 
 # %% Calculate chemical validity for base2backbone
-
-
-BASE2BACKBONE_BENCHMARK_TIMESTEPS = 15
-BASE2BACKBONE_STRUCTURE_BATCH_SIZE = 4
-BASE2BACKBONE_WINDOW_BATCH_SIZE = 20000
 
 base2backbone_window_size = int(test_dataset.base.window_size)
 model.eval()
@@ -1592,7 +1622,7 @@ KNN_MOLPROBITY_FEATURE_NAMES = [
 
 test_molprobity_input_paths = collect_test_dataset_raw_paths(test_dataset)
 knn_molprobity_window_size = int(test_dataset.base.window_size)
-KNN_FIT_CACHE: dict[tuple[str, ...], tuple[Any, ...]] = {}
+KNN_FIT_CACHE: dict[Hashable, tuple[Any, ...]] = {}
 KNN_STRUCTURE_BATCH_SIZE = 8
 
 for feature_set_name, feature_names in feature_sets:
@@ -1879,8 +1909,6 @@ print_rmsd_summary(
 )
 
 # %% Best-of-k decoder RMSD vs true coords and MolProbity
-BEST_OF_K_LIST = [1, 2, 4, 7, 10, 15]
-BEST_OF_K_BENCHMARK_TIMESTEPS = 15
 
 best_of_k_rmsds_by_k_list = {k: [] for k in BEST_OF_K_LIST}
 best_of_k_is_edge_list: list[bool] = []
@@ -1960,10 +1988,12 @@ with torch.no_grad():
 best_of_k_molprobity_rows_by_k = run_base2backbone_best_of_k_benchmark(
     collect_test_dataset_raw_paths(test_dataset),
     BEST_OF_K_MOLPROBITY_ROOT,
-    sampler=CheckpointSamplerAdapter(model, BEST_OF_K_BENCHMARK_TIMESTEPS),
+    checkpoint_model=model,
     device=device,
     window_size=int(test_dataset.base.window_size),
     best_of_k_list=BEST_OF_K_LIST,
+    num_timesteps=BEST_OF_K_BENCHMARK_TIMESTEPS,
+    batch_size=BASE2BACKBONE_STRUCTURE_BATCH_SIZE,
     window_batch_size=BASE2BACKBONE_WINDOW_BATCH_SIZE,
     resume=True,
     molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,

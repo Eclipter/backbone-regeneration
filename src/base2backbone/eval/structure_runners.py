@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 import time
 import warnings
 from pathlib import Path
@@ -11,15 +10,16 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 import torch
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from tqdm import tqdm
 
 from ..data import parse_dna
+from ..runtime import PROGRESS_BAR_COLOR
 from ..inference import (
     _build_output_universe as build_output_universe,
     _predict_backbone_from_chain_records as predict_backbone_from_chain_records,
     write_structure,
 )
-from .molprobity import annotate_benchmark_rows_with_molprobity
-from .structure_rmsd import median_backbone_rmsd_vs_reference
+from .structure_rmsd import median_backbone_rmsd_vs_predictions
 
 if TYPE_CHECKING:
     from .knn_baseline import KnnBaselineState
@@ -426,6 +426,7 @@ def run_base2backbone_best_of_k_inference(
     best_of_k_list: list[int],
     window_batch_size: int | None = None,
     resume: bool = True,
+    show_progress: bool = True,
 ) -> dict[int, dict[str, Any]]:
     """Run up to max(k) stochastic samples; export best-vs-ref snapshot at each k."""
     input_path = Path(input_path).resolve()
@@ -473,7 +474,18 @@ def run_base2backbone_best_of_k_inference(
     results: dict[int, dict[str, Any]] = {}
 
     with torch.inference_mode():
-        for sample_idx in range(1, k_max + 1):
+        sample_iter = range(1, k_max + 1)
+        if show_progress:
+            sample_iter = tqdm(
+                sample_iter,
+                total=k_max,
+                desc=f'best-of-k samples ({input_path.stem})',
+                leave=False,
+                colour=PROGRESS_BAR_COLOR,
+            )
+        for sample_idx in sample_iter:
+            if show_progress and hasattr(sample_iter, 'set_postfix_str'):
+                sample_iter.set_postfix_str(f'sample {sample_idx}/{k_max}')
             try:
                 predictions = predict_backbone_from_chain_records(
                     [chain_records],
@@ -495,16 +507,11 @@ def run_base2backbone_best_of_k_inference(
                         results[k] = failure
                 return results
 
-            with tempfile.NamedTemporaryFile(suffix='.pdb') as tmp:
-                write_structure(
-                    build_output_universe(full_chain_records, predictions),
-                    tmp.name,
-                )
-                score = median_backbone_rmsd_vs_reference(
-                    input_path,
-                    tmp.name,
-                    window_size=window_size,
-                )
+            score = median_backbone_rmsd_vs_predictions(
+                input_path,
+                predictions,
+                window_size=window_size,
+            )
 
             if score is not None and (best_score is None or score < best_score):
                 best_score = score
@@ -558,22 +565,196 @@ def run_base2backbone_best_of_k_inference_batch(
     best_of_k_list: list[int],
     window_batch_size: int | None = None,
     resume: bool = True,
+    show_progress: bool = True,
 ) -> dict[str, dict[int, dict[str, Any]]]:
     output_root = Path(output_root).resolve()
     results: dict[str, dict[int, dict[str, Any]]] = {}
-    for raw_input_path in input_paths:
-        input_path = Path(raw_input_path).resolve()
-        results[str(input_path)] = run_base2backbone_best_of_k_inference(
-            input_path,
-            output_root,
-            sampler=sampler,
-            device=device,
-            window_size=window_size,
-            best_of_k_list=best_of_k_list,
-            window_batch_size=window_batch_size,
-            resume=resume,
+    k_values = sorted({int(k) for k in best_of_k_list if int(k) > 0})
+    if not k_values:
+        raise ValueError('best_of_k_list must contain at least one positive k')
+    k_max = max(k_values)
+    k_snapshot_set = set(k_values)
+    pending: list[tuple[Path, Any, Any, float]] = []
+    resolved_input_paths = [Path(path).resolve() for path in input_paths]
+
+    path_iter = resolved_input_paths
+    if show_progress:
+        path_iter = tqdm(
+            resolved_input_paths,
+            desc='best-of-k prepare batch',
+            leave=False,
+            colour=PROGRESS_BAR_COLOR,
         )
+    for input_path in path_iter:
+        if show_progress and hasattr(path_iter, 'set_postfix_str'):
+            path_iter.set_postfix_str(input_path.stem)
+        input_key = str(input_path)
+        t0 = time.perf_counter()
+
+        if resume and _best_of_k_outputs_complete(input_path, output_root, k_values):
+            results[input_key] = {
+                k: _benchmark_success_result(
+                    _best_of_k_output_pdb(output_root, k, input_path),
+                    t0,
+                    wall_time_s=0.0,
+                )
+                for k in k_values
+            }
+            continue
+
+        try:
+            _, chain_records = parse_dna(
+                str(input_path),
+                use_full_nucleotide=False,
+                window_size=window_size,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', PDBConstructionWarning)
+                _, full_chain_records = parse_dna(
+                    str(input_path),
+                    use_full_nucleotide=True,
+                    window_size=window_size,
+                )
+        except Exception as exc:
+            failure = {
+                'success': False,
+                'wall_time_s': time.perf_counter() - t0,
+                'returncode': -999,
+                'output_pdb': None,
+                'stdout': '',
+                'stderr': repr(exc),
+            }
+            results[input_key] = {k: failure for k in k_values}
+            continue
+
+        pending.append((input_path, chain_records, full_chain_records, t0))
+
+    if not pending:
+        return results
+
+    best_scores: list[float | None] = [None] * len(pending)
+    best_predictions: list[Any | None] = [None] * len(pending)
+    pending_chain_records = [chain_records for _, chain_records, _, _ in pending]
+
+    with torch.inference_mode():
+        sample_desc = 'best-of-k diffusion samples'
+        if pending:
+            stems = ', '.join(path.stem for path, *_ in pending[:3])
+            if len(pending) > 3:
+                stems = f'{stems}, ...'
+            sample_desc = f'best-of-k samples [{stems}]'
+        sample_iter = range(1, k_max + 1)
+        if show_progress:
+            sample_iter = tqdm(
+                sample_iter,
+                total=k_max,
+                desc=sample_desc,
+                leave=False,
+                colour=PROGRESS_BAR_COLOR,
+            )
+        for sample_idx in sample_iter:
+            if show_progress and hasattr(sample_iter, 'set_postfix_str'):
+                sample_iter.set_postfix_str(f'sample {sample_idx}/{k_max}')
+            try:
+                predictions_by_structure = predict_backbone_from_chain_records(
+                    pending_chain_records,
+                    sampler,
+                    device,
+                    window_batch_size=window_batch_size,
+                )
+            except Exception as exc:
+                for input_path, _chain_records, _full_chain_records, t0 in pending:
+                    failure = {
+                        'success': False,
+                        'wall_time_s': time.perf_counter() - t0,
+                        'returncode': -999,
+                        'output_pdb': None,
+                        'stdout': '',
+                        'stderr': repr(exc),
+                    }
+                    results[str(input_path)] = {k: failure for k in k_values}
+                return results
+
+            for batch_idx, (
+                input_path,
+                _chain_records,
+                full_chain_records,
+                t0,
+            ) in enumerate(pending):
+                predictions = predictions_by_structure[batch_idx]
+                score = median_backbone_rmsd_vs_predictions(
+                    input_path,
+                    predictions,
+                    window_size=window_size,
+                )
+
+                if score is not None and (
+                    best_scores[batch_idx] is None or score < best_scores[batch_idx]
+                ):
+                    best_scores[batch_idx] = score
+                    best_predictions[batch_idx] = predictions
+
+                if sample_idx not in k_snapshot_set or best_predictions[batch_idx] is None:
+                    continue
+
+                structure_results = results.setdefault(str(input_path), {})
+                try:
+                    output_pdb = _write_best_of_k_snapshot(
+                        input_path=input_path,
+                        output_root=output_root,
+                        k=sample_idx,
+                        full_chain_records=full_chain_records,
+                        best_predictions=best_predictions[batch_idx],
+                    )
+                except Exception as exc:
+                    structure_results[sample_idx] = {
+                        'success': False,
+                        'wall_time_s': time.perf_counter() - t0,
+                        'returncode': -999,
+                        'output_pdb': None,
+                        'stdout': '',
+                        'stderr': repr(exc),
+                    }
+                    continue
+
+                structure_results[sample_idx] = _benchmark_success_result(output_pdb, t0)
+
+    for input_path, _chain_records, _full_chain_records, t0 in pending:
+        structure_results = results.setdefault(str(input_path), {})
+        for k in k_values:
+            if k not in structure_results:
+                structure_results[k] = {
+                    'success': False,
+                    'wall_time_s': time.perf_counter() - t0,
+                    'returncode': -999,
+                    'output_pdb': None,
+                    'stdout': '',
+                    'stderr': 'no successful best-of-k snapshot',
+                }
     return results
+
+
+def run_base2backbone_best_of_k_inference_pooled(
+    input_path: str | Path,
+    output_root: str | Path,
+    *,
+    best_of_k_list: list[int],
+    window_batch_size: int | None = None,
+    resume: bool = True,
+) -> dict[int, dict[str, Any]]:
+    if _pool_base2backbone is None:
+        raise RuntimeError('base2backbone worker pool not initialized')
+    ctx = _pool_base2backbone
+    return run_base2backbone_best_of_k_inference(
+        input_path,
+        output_root,
+        sampler=ctx['sampler'],
+        device=ctx['device'],
+        window_size=ctx['window_size'],
+        best_of_k_list=best_of_k_list,
+        window_batch_size=window_batch_size,
+        resume=resume,
+    )
 
 
 def run_base2backbone_best_of_k_inference_batch_pooled(
@@ -597,60 +778,6 @@ def run_base2backbone_best_of_k_inference_batch_pooled(
         window_batch_size=window_batch_size,
         resume=resume,
     )
-
-
-def _best_of_k_benchmark_row(input_path: Path, res: dict[str, Any]) -> dict[str, Any]:
-    return {
-        'id': input_path.stem,
-        'input_path': str(input_path),
-        'success': res['success'],
-        'wall_time_s': res['wall_time_s'],
-        'returncode': res['returncode'],
-        'output_pdb': str(res['output_pdb']) if res['output_pdb'] else '',
-        'stderr': res['stderr'][:1000],
-    }
-
-
-def run_base2backbone_best_of_k_benchmark(
-    input_paths: list[str | Path],
-    output_root: str | Path,
-    *,
-    sampler: BackboneSampler,
-    device: str,
-    window_size: int,
-    best_of_k_list: list[int],
-    window_batch_size: int | None = None,
-    resume: bool = True,
-    molprobity_timeout_s: int = 600,
-    molprobity_max_workers: int = 32,
-) -> dict[int, list[dict[str, Any]]]:
-    """Best-of-k structure export with MolProbity validation after each structure."""
-    k_values = sorted({int(k) for k in best_of_k_list if int(k) > 0})
-    rows_by_k: dict[int, list[dict[str, Any]]] = {k: [] for k in k_values}
-
-    for raw_input_path in input_paths:
-        input_path = Path(raw_input_path).resolve()
-        per_k = run_base2backbone_best_of_k_inference(
-            input_path,
-            output_root,
-            sampler=sampler,
-            device=device,
-            window_size=window_size,
-            best_of_k_list=best_of_k_list,
-            window_batch_size=window_batch_size,
-            resume=resume,
-        )
-        for k in k_values:
-            row = _best_of_k_benchmark_row(input_path, per_k[k])
-            rows_by_k[k].append(row)
-            annotate_benchmark_rows_with_molprobity(
-                [row],
-                timeout_s=molprobity_timeout_s,
-                max_workers=molprobity_max_workers,
-                resume=resume,
-            )
-
-    return rows_by_k
 
 
 def run_knn_baseline_structure(

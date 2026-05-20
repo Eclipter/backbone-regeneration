@@ -37,13 +37,13 @@ from .molprobity import (
 )
 from .structure_rmsd import (
     compute_structure_vs_ref_backbone_rmsd,
+    median_backbone_rmsd_vs_predictions,
     median_backbone_rmsd_vs_reference,
 )
 from .structure_runners import (
     CheckpointSamplerAdapter,
     FixedTorsionSampler,
     init_base2backbone_inference_worker,
-    run_base2backbone_best_of_k_benchmark,
     run_base2backbone_best_of_k_inference,
     run_base2backbone_best_of_k_inference_batch,
     run_base2backbone_best_of_k_inference_batch_pooled,
@@ -54,6 +54,7 @@ from .structure_runners import (
     run_knn_baseline_structure,
     run_mean_baseline_structure,
 )
+from .best_of_k_benchmark import run_base2backbone_best_of_k_benchmark
 
 __all__ = [
     'KnnBaselineState',
@@ -77,6 +78,7 @@ __all__ = [
     'knn_match_indices',
     'local_backbone_rmsd',
     'local_to_world_np',
+    'median_backbone_rmsd_vs_predictions',
     'median_backbone_rmsd_vs_reference',
     'ordered_backbone_segments',
     'phosphodiester_segments_local',

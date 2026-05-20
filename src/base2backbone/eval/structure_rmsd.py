@@ -27,6 +27,24 @@ def residue_backbone_positions(chain_records):
     return residue_positions
 
 
+def prediction_backbone_positions(chain_records, predictions) -> dict:
+    """Backbone atom coords from an inference predictions dict (no PDB round-trip)."""
+    residue_positions = {}
+    for chain_key, chain, _ in chain_records:
+        for nucleotide in chain:
+            segid = nucleotide.segid
+            resid = int(nucleotide.resid)
+            residue_key = (chain_key, resid)
+            atoms = {
+                atom_name: np.asarray(xyz, dtype=np.float64)
+                for atom_name in BACKBONE_ATOMS
+                if (xyz := predictions.get((segid, resid, atom_name))) is not None
+            }
+            if atoms:
+                residue_positions[residue_key] = atoms
+    return residue_positions
+
+
 def backbone_local_array(atom_positions, origin_world, frame_world):
     local_coords = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
     for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
@@ -84,37 +102,21 @@ def collect_backbone_local_arrays(ref_chain_records, *position_maps):
     return local_arrays
 
 
-def compute_structure_vs_ref_backbone_rmsd(
-    reference_path: str | Path,
-    output_path: str | Path,
-    window_size: int = 3,
+def _backbone_rmsd_stats_from_position_maps(
+    ref_chain_records,
+    ref_positions,
+    output_positions,
 ) -> dict[str, Any]:
-    reference_path = Path(reference_path)
-    output_path = Path(output_path)
-    ref_chain_records = parse_chain_records_for_backbone_rmsd(
-        str(reference_path.resolve()),
-        window_size=window_size,
-    )
-    output_chain_records = parse_chain_records_for_backbone_rmsd(
-        str(output_path.resolve()),
-        window_size=window_size,
-    )
-
-    ref_positions = residue_backbone_positions(ref_chain_records)
-    output_positions = residue_backbone_positions(output_chain_records)
-
     local_arrays = collect_backbone_local_arrays(
         ref_chain_records,
         ref_positions,
         output_positions,
     )
     rmsds = []
-    rmsd_is_edge = []
-    for (ref_local, output_local), is_edge in local_arrays:
+    for (ref_local, output_local), _is_edge in local_arrays:
         rmsd = local_backbone_rmsd(output_local, ref_local)
         if np.isfinite(rmsd):
             rmsds.append(float(rmsd))
-            rmsd_is_edge.append(is_edge)
 
     if not rmsds:
         return {
@@ -133,6 +135,50 @@ def compute_structure_vs_ref_backbone_rmsd(
         'median_rmsd': float(np.median(rmsd_arr)),
         'p90_rmsd': float(np.percentile(rmsd_arr, 90)),
     }
+
+
+def compute_structure_vs_ref_backbone_rmsd(
+    reference_path: str | Path,
+    output_path: str | Path,
+    window_size: int = 3,
+) -> dict[str, Any]:
+    reference_path = Path(reference_path)
+    output_path = Path(output_path)
+    ref_chain_records = parse_chain_records_for_backbone_rmsd(
+        str(reference_path.resolve()),
+        window_size=window_size,
+    )
+    output_chain_records = parse_chain_records_for_backbone_rmsd(
+        str(output_path.resolve()),
+        window_size=window_size,
+    )
+
+    return _backbone_rmsd_stats_from_position_maps(
+        ref_chain_records,
+        residue_backbone_positions(ref_chain_records),
+        residue_backbone_positions(output_chain_records),
+    )
+
+
+def median_backbone_rmsd_vs_predictions(
+    reference_path: str | Path,
+    predictions,
+    *,
+    window_size: int = 3,
+) -> float | None:
+    """Median per-residue backbone RMSD vs reference; scores in-memory predictions."""
+    ref_chain_records = parse_chain_records_for_backbone_rmsd(
+        str(Path(reference_path).resolve()),
+        window_size=window_size,
+    )
+    stats = _backbone_rmsd_stats_from_position_maps(
+        ref_chain_records,
+        residue_backbone_positions(ref_chain_records),
+        prediction_backbone_positions(ref_chain_records, predictions),
+    )
+    if not stats['success']:
+        return None
+    return stats['median_rmsd']
 
 
 def median_backbone_rmsd_vs_reference(
